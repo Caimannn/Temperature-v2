@@ -1,0 +1,78 @@
+{
+  "mode": "manual-only",
+  "automation_enabled": false,
+  "execution_enabled": false,
+  "kill_switch": false,
+  "horizons": ["today", "tomorrow"],
+  "cities": {
+    "nyc": {
+      "resolver": {
+        "type": "placeholder",
+        "enabled": false
+      }
+    },
+    "atlanta": {
+      "resolver": {
+        "type": "placeholder",
+        "enabled": false
+      }
+    },
+    "dallas": {
+      "resolver": {
+        "type": "placeholder",
+        "enabled": false
+      }
+    },
+    "chicago": {
+      "resolver": {
+        "type": "placeholder",
+        "enabled": false
+      }
+    }
+  },
+  "weather_provider": {
+    "providers": {
+      "openweather": {
+        "enabled": true,
+        "api_key_env": "OPENWEATHER_API_KEY"
+      },
+      "weatherapi": {
+        "enabled": true,
+        "api_key_env": "WEATHERAPI_KEY"
+      },
+      "tomorrow": {
+        "enabled": false,
+        "api_key_env": "TOMORROW_API_KEY"
+      }
+    }
+  },
+  "discord": {
+    "enabled": true,
+    "main_panel": true,
+    "token_env": "DISCORD_BOT_TOKEN",
+    "signal_channel_id_env": "DISCORD_SIGNAL_CHANNEL_ID",
+    "controls": [
+      "city_switch",
+      "positions_check",
+      "mode_switch",
+      "kill_switch",
+      "health_check"
+    ]
+  },
+  "polling": {
+    "market_stream_enabled": true,
+    "market_snapshot_fallback_interval_seconds": 300,
+    "weather_polling_interval_seconds": 600,
+    "positions_polling_interval_seconds": 900,
+    "panel_refresh_interval_seconds": 60
+  },
+  "signal_thresholds": {
+    "placeholder": true
+  },
+  "cheap_tail_thresholds": {
+    "placeholder": true
+  },
+  "positions_advice_thresholds": {
+    "placeholder": true
+  }
+}

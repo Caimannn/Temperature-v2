@@ -37,6 +37,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - import guard for schedu
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "config.yaml"
 POLICY_SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "test_signal_policy.py"
 AUDIT_LOG_PATH = Path(__file__).resolve().parents[2] / "output" / "audit" / "live_signal_runs.csv"
+SCHEDULER_RUN_LOG_PATH = Path(__file__).resolve().parents[2] / "output" / "audit" / "daily_scheduler_runs.csv"
 AVAILABLE_MODES = ("manual-only", "auto+manual")
 DEFAULT_SIGNAL_CITIES = ("nyc", "atlanta", "chicago", "dallas")
 DAILY_TRIGGER_HOUR_UTC = 12
@@ -189,6 +190,28 @@ def _append_signal_audit_row(city: str, state: str, candidate: str, score: str, 
         AUDIT_LOG_PATH.write_text(header + row, encoding="utf-8")
         return
     with AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(row)
+
+
+def _append_scheduler_run_row(
+    run_timestamp_utc: datetime,
+    city: str,
+    source: str,
+    outcome: str,
+    reason: str,
+) -> None:
+    """Append one scheduler diagnostic row for each city processed by daily task."""
+
+    SCHEDULER_RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = run_timestamp_utc.replace(microsecond=0).isoformat()
+    clean_reason = " ".join(str(reason).replace("\n", " ").replace("\r", " ").split())
+    clean_reason = clean_reason.replace(",", ";")
+    header = "run_timestamp_utc,city,source,outcome,reason\n"
+    row = f"{timestamp},{city},{source},{outcome},{clean_reason}\n"
+    if not SCHEDULER_RUN_LOG_PATH.exists():
+        SCHEDULER_RUN_LOG_PATH.write_text(header + row, encoding="utf-8")
+        return
+    with SCHEDULER_RUN_LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(row)
 
 
@@ -623,7 +646,11 @@ if discord is not None:
                 return
 
             try:
-                posted, no_signal = await self._post_policy_signals_to_channel(channel)
+                posted, no_signal = await self._post_policy_signals_to_channel(
+                    channel,
+                    trigger_source=trigger_source,
+                    run_timestamp_utc=now_utc,
+                )
                 self.last_daily_run_date = now_utc.date()
                 if no_signal:
                     _log_panel_event(
@@ -636,6 +663,13 @@ if discord is not None:
                         f"wakeup_utc={now_utc.isoformat()} source={trigger_source} posted={posted}",
                     )
             except Exception as exc:
+                _append_scheduler_run_row(
+                    run_timestamp_utc=now_utc,
+                    city="ALL",
+                    source=trigger_source,
+                    outcome="failed",
+                    reason=str(exc),
+                )
                 _log_panel_event(
                     "daily_task",
                     f"wakeup_utc={now_utc.isoformat()} source={trigger_source} failed={exc}",
@@ -698,7 +732,12 @@ if discord is not None:
             if missing:
                 _log_panel_event("permission_check_missing", ",".join(missing))
 
-        async def _post_policy_signals_to_channel(self, channel: discord.abc.Messageable) -> tuple[int, bool]:
+        async def _post_policy_signals_to_channel(
+            self,
+            channel: discord.abc.Messageable,
+            trigger_source: str,
+            run_timestamp_utc: datetime,
+        ) -> tuple[int, bool]:
             """Post policy dry-run blocks to a channel and return (posted_count, no_signal)."""
 
             blocks, summary = await run_policy_dry_run(list(DEFAULT_SIGNAL_CITIES))
@@ -706,8 +745,25 @@ if discord is not None:
             posted = 0
             for block in blocks:
                 if block.primary_candidate == "NONE":
+                    _append_scheduler_run_row(
+                        run_timestamp_utc=run_timestamp_utc,
+                        city=block.city.upper(),
+                        source=trigger_source,
+                        outcome="no_signal",
+                        reason="primary_candidate_none",
+                    )
                     continue
-                await channel.send(embed=build_signal_embed(block))
+                try:
+                    await channel.send(embed=build_signal_embed(block))
+                except Exception as exc:
+                    _append_scheduler_run_row(
+                        run_timestamp_utc=run_timestamp_utc,
+                        city=block.city.upper(),
+                        source=trigger_source,
+                        outcome="failed",
+                        reason=f"send_embed_failed:{exc}",
+                    )
+                    raise
                 state, score = _extract_signal_state_score(block.discord_preview)
                 _append_signal_audit_row(
                     city=block.city.upper(),
@@ -715,6 +771,13 @@ if discord is not None:
                     candidate=block.primary_candidate,
                     score=score,
                     posted=True,
+                )
+                _append_scheduler_run_row(
+                    run_timestamp_utc=run_timestamp_utc,
+                    city=block.city.upper(),
+                    source=trigger_source,
+                    outcome="posted",
+                    reason=block.primary_candidate,
                 )
                 posted += 1
 
@@ -728,6 +791,14 @@ if discord is not None:
                     score="n/a",
                     posted=False,
                 )
+                if not blocks:
+                    _append_scheduler_run_row(
+                        run_timestamp_utc=run_timestamp_utc,
+                        city="ALL",
+                        source=trigger_source,
+                        outcome="no_signal",
+                        reason="no_blocks_from_policy",
+                    )
 
             if summary is None:
                 summary_lines = [

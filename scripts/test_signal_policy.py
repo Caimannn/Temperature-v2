@@ -221,7 +221,45 @@ def _resolve_city_list(args: argparse.Namespace) -> list[str]:
     return [item for item in parts if item]
 
 
-def _build_discord_preview(final_rows: list[Any]) -> tuple[str, int, str, float | None]:
+def _normalize_label(label: str) -> str:
+    """Normalize range label text for robust metadata lookup."""
+
+    return " ".join(str(label).strip().lower().split())
+
+
+def _best_quote_level(raw_quote: Any, side_key: str) -> float | None:
+    """Extract best bid/ask from raw quote payload."""
+
+    if not isinstance(raw_quote, Mapping):
+        return None
+    levels = raw_quote.get(side_key)
+    if not isinstance(levels, list) or not levels:
+        return None
+
+    best: float | None = None
+    for level in levels:
+        if not isinstance(level, Mapping):
+            continue
+        raw_price = level.get("price", level.get("p"))
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            continue
+        if best is None:
+            best = price
+            continue
+        if side_key == "bids" and price > best:
+            best = price
+        if side_key == "asks" and price < best:
+            best = price
+    return best
+
+
+def _build_discord_preview(
+    final_rows: list[Any],
+    market_metadata: list[dict[str, Any]],
+    quote_data: Mapping[str, Any],
+) -> tuple[str, int, str, float | None, dict[str, Any]]:
     """Build compact Discord-safe preview from final policy rows only."""
 
     source_count = len(final_rows)
@@ -237,6 +275,7 @@ def _build_discord_preview(final_rows: list[Any]) -> tuple[str, int, str, float 
             source_count,
             "NONE",
             None,
+            {},
         )
 
     primary = sorted(
@@ -246,15 +285,75 @@ def _build_discord_preview(final_rows: list[Any]) -> tuple[str, int, str, float 
 
     entry = "N/A" if primary.entry_price is None else f"{primary.entry_price:.4f}"
     exec_edge = "N/A" if primary.executable_edge is None else f"{primary.executable_edge:+.4f}"
+    model_prob = getattr(primary, "model_probability", None)
+    market_prob = getattr(primary, "market_probability", None)
+    spread = getattr(primary, "spread", None)
+    model_prob_text = "N/A" if model_prob is None else f"{float(model_prob):.4f}"
+    spread_text = "N/A" if spread is None else f"{float(spread):.4f}"
+
     preview = (
         f"{primary.city.upper()} {primary.target_date} | "
         f"{primary.range_label} {primary.side} | "
         f"{primary.policy_state} score={primary.policy_score:.3f} | "
         f"entry={entry} exec_edge={exec_edge} | "
+        f"model_prob={model_prob_text} spread={spread_text} | "
         f"reason={primary.decision_reason}"
     )
     primary_id = f"{primary.range_label}/{primary.side}"
-    return preview, source_count, primary_id, float(primary.policy_score)
+
+    normalized_primary_label = _normalize_label(primary.range_label)
+    metadata_row = next(
+        (
+            row for row in market_metadata
+            if _normalize_label(str(row.get("range_label", ""))) == normalized_primary_label
+        ),
+        None,
+    )
+
+    yes_token_id = ""
+    no_token_id = ""
+    if metadata_row is not None:
+        yes_token_id = str(
+            metadata_row.get("yes_token_id")
+            or metadata_row.get("yesTokenId")
+            or metadata_row.get("token_id_yes")
+            or ""
+        )
+        no_token_id = str(
+            metadata_row.get("no_token_id")
+            or metadata_row.get("noTokenId")
+            or metadata_row.get("token_id_no")
+            or ""
+        )
+
+    side_text = str(getattr(primary, "side", "") or "")
+    resolved_token_id = no_token_id if side_text == "BUY_NO" else yes_token_id
+    if not resolved_token_id:
+        resolved_token_id = str(getattr(primary, "token_id", "") or "")
+
+    raw_quote = quote_data.get(resolved_token_id) if resolved_token_id else None
+    best_bid = _best_quote_level(raw_quote, "bids")
+    best_ask = _best_quote_level(raw_quote, "asks")
+
+    signal_meta = {
+        "market_slug": str(getattr(primary, "event_slug", "") or ""),
+        "token_id": resolved_token_id,
+        "yes_token_id": yes_token_id,
+        "no_token_id": no_token_id,
+        "target_date": str(getattr(primary, "target_date", "today") or "today"),
+        "side": str(getattr(primary, "side", "") or ""),
+        "range_label": str(getattr(primary, "range_label", "") or ""),
+        "entry_price": (None if primary.entry_price is None else float(primary.entry_price)),
+        "model_prob": (None if model_prob is None else float(model_prob)),
+        "market_prob": (None if market_prob is None else float(market_prob)),
+        "book_best_bid": best_bid,
+        "book_best_ask": best_ask,
+        "executable_edge": (None if primary.executable_edge is None else float(primary.executable_edge)),
+        "spread": (None if spread is None else float(spread)),
+        "calibration_state": "CALIBRATED" if primary.policy_state in {"PAPER", "TRADE_CANDIDATE"} else "UNKNOWN",
+        "policy_version": "signal_policy_v1",
+    }
+    return preview, source_count, primary_id, float(primary.policy_score), signal_meta
 
 
 def _snapshot_path_for_city(
@@ -331,12 +430,12 @@ def _run_city_dry_run(
     args: argparse.Namespace,
     target_date: dt.date | None,
     is_multi_city: bool,
-) -> tuple[str, int, str, float | None]:
+) -> tuple[str, int, str, float | None, dict[str, Any]]:
     """Run one city policy pipeline in quiet dry-run mode and return discord preview triple."""
 
     horizon = str(args.horizon).strip().lower()
     if city_key not in cities_cfg or horizon not in SUPPORTED_HORIZONS:
-        return ("NO_SIGNAL | city/horizon unavailable", 0, "NONE", None)
+        return ("NO_SIGNAL | city/horizon unavailable", 0, "NONE", None, {})
 
     city = build_city_config(city_key, cities_cfg[city_key])
     snapshots = [
@@ -345,7 +444,7 @@ def _run_city_dry_run(
     ]
     snapshots = [s for s in snapshots if not (math.isnan(s.predicted_tmax_f) or "error" in s.raw_payload)]
     if not snapshots:
-        return ("NO_SIGNAL | no successful provider snapshots", 0, "NONE", None)
+        return ("NO_SIGNAL | no successful provider snapshots", 0, "NONE", None, {})
 
     aggregate = aggregate_forecasts(snapshots)
     distribution = build_temperature_bin_probabilities(aggregate)
@@ -359,7 +458,7 @@ def _run_city_dry_run(
         city_slug_prefix=slug_prefix,
     )
     if not metadata:
-        return ("NO_SIGNAL | no event-scoped market bins", 0, "NONE", None)
+        return ("NO_SIGNAL | no event-scoped market bins", 0, "NONE", None, {})
 
     event_slug = str(metadata[0].get("event_slug", ""))
     effective_target_date = target_date.isoformat() if target_date is not None else "today"
@@ -371,7 +470,7 @@ def _run_city_dry_run(
         SignalCandidateFilters(minimum_absolute_edge=float(args.min_abs_edge)),
     )
     if not signal_result.all_ranked_candidates:
-        return ("NO_SIGNAL | no ranked signal candidates", 0, "NONE", None)
+        return ("NO_SIGNAL | no ranked signal candidates", 0, "NONE", None, {})
 
     quotes = fetch_quotes_for_metadata(metadata)
     evaluation = evaluate_executable_signal_candidates(
@@ -440,7 +539,7 @@ def _run_city_dry_run(
             policy_result=policy_result,
         )
 
-    return _build_discord_preview(list(policy_result.rows))
+    return _build_discord_preview(list(policy_result.rows), metadata, quotes)
 
 
 def main() -> int:
@@ -494,7 +593,7 @@ def main() -> int:
         is_multi_city = len(city_keys) > 1
         city_results: list[tuple[str, int, str, float | None, str]] = []
         for city_item in city_keys:
-            preview, source_count, primary_id, top_score = _run_city_dry_run(
+            preview, source_count, primary_id, top_score, signal_meta = _run_city_dry_run(
                 city_key=city_item,
                 cities_cfg=cities,
                 bundle=bundle,
@@ -506,6 +605,7 @@ def main() -> int:
             print(f"discord_preview={preview}")
             print(f"source_candidate_count={source_count}")
             print(f"primary_candidate={primary_id}")
+            print(f"signal_meta={json.dumps(signal_meta, separators=(',', ':'))}")
 
         if is_multi_city:
             with_signal = [item for item in city_results if item[2] != "NONE"]
